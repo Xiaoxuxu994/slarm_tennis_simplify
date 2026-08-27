@@ -1,12 +1,12 @@
-"""内建 ball token 的评测链路冒烟测试（被测对象：tools/eval_stream25_base.py）。
+"""内建 ball token 的评测链路冒烟测试（被测对象：scripts/eval_stream25_base.py）。
 
 覆盖三段：StreamSession 透传 -> 指标计算 -> scope 聚合与门禁隔离。
 不需要真实 ckpt 或数据，只要有 torch 就能跑：
 
-    pytest tests/tools/test_ball_token_eval.py -v
+    pytest tests/scripts/test_ball_token_eval.py -v
 
 repo 根既没有 conftest.py 也没有 pytest 配置，pytest 默认只把测试文件所在目录
-放进 sys.path，所以这里显式插入 repo 根。tools/ 有 __init__.py，是常规包。
+放进 sys.path，所以这里显式插入 repo 根。scripts/ 没有 __init__.py，靠 PEP 420 隐式命名空间包导入。
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ REPO = Path(__file__).resolve().parents[2]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from tools import eval_stream25_base as ev  # noqa: E402
+from scripts import eval_stream25_base as ev  # noqa: E402
 from src.models.stream_session import StreamSession  # noqa: E402
 from src.utils.stream25_metrics import (  # noqa: E402
     ACCEPTANCE_TABLE,
