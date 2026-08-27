@@ -35,9 +35,20 @@ from src.utils.stream25_metrics import (
     compute_ssim,
     finite_percentile,
     integrate_frame24_position,
+    integrate_frame24_position_physics,
     transform_position,
     transform_vector,
 )
+from src.dataset.stream25 import MS3_GRAVITY_RIG
+
+# ball token 的并列落点指标名（不进 ACCEPTANCE_TABLE，只做对照）。
+BALL_TOKEN_METRIC_NAMES = (
+    "frame24_position_balltoken",
+    "ball_pos15_error",
+    "ball_vel15_error",
+)
+# 这些指标跨场景聚合时，p95 子键取场景间的 95 分位（与 frame24_position 同口径）。
+_P95_ACROSS_SCENES = ("frame24_position",) + BALL_TOKEN_METRIC_NAMES
 
 FINAL_TEST_SENTINEL_DIR = str(
     WORKTREE / "data" / "SLARM_data" / ".stream25_final_test_registry"
@@ -196,6 +207,50 @@ def apply_scoped_acceptance_gates(
     }
 
 
+def compute_balltoken_frame24_metrics(
+    ball_pos15: Optional[torch.Tensor],
+    ball_v15: Optional[torch.Tensor],
+    data_dict: Dict,
+    gt_pos24: torch.Tensor,
+    *,
+    dt: float,
+) -> Optional[Dict[str, float]]:
+    """Score the internal ball token against frame-15 truth and the frame-24 landing.
+
+    ``ball_pos15``/``ball_v15`` are regressed directly in the scene-fixed rig frame
+    (same frame the ``ball_position_rig`` supervision lives in), so no
+    ``canonical_to_rig`` transform applies here — unlike the per-pixel path, which
+    reads Gaussian means in the canonical frame. Frame 24 uses the physical
+    extrapolation ``pos15 + v15*dt + 0.5*g*dt**2``: the ball token supplies no
+    acceleration, and gravity is known.
+
+    Returns ``None`` when the model has no ball token, so the metric is simply
+    absent rather than reported as a failure.
+    """
+    if ball_pos15 is None or ball_v15 is None:
+        return None
+    pos15 = ball_pos15.reshape(-1)[:3].float().cpu()
+    v15 = ball_v15.reshape(-1)[:3].float().cpu()
+    if not (torch.isfinite(pos15).all() and torch.isfinite(v15).all()):
+        return None
+    gravity = pos15.new_tensor(MS3_GRAVITY_RIG)
+    pred_pos24 = integrate_frame24_position_physics(pos15, v15, dt, gravity)
+    metrics = {
+        "frame24_position_balltoken": float((pred_pos24 - gt_pos24).norm().item()),
+    }
+    # frame-15 truth is optional: ball_velocity_rig in particular is not emitted by
+    # every dataset, so those two diagnostics drop out instead of failing the scene.
+    gt_pos15 = data_dict.get("ball_position_rig")
+    if gt_pos15 is not None:
+        gt = gt_pos15[0, 15].float().cpu()
+        metrics["ball_pos15_error"] = float((pos15 - gt).norm().item())
+    gt_v15 = data_dict.get("ball_velocity_rig")
+    if gt_v15 is not None:
+        gt = gt_v15[0, 15].float().cpu()
+        metrics["ball_vel15_error"] = float((v15 - gt).norm().item())
+    return metrics
+
+
 def compute_rendered_frame24_position_errors(
     depth15: torch.Tensor,
     semantic15: torch.Tensor,
@@ -295,7 +350,7 @@ def _aggregate_scene_scope_metrics(
             ]
             percentile = (
                 95
-                if metric_name == "frame24_position" and subkey == "p95"
+                if metric_name in _P95_ACROSS_SCENES and subkey == "p95"
                 else 50
             )
             metrics[metric_name][subkey] = finite_percentile(
@@ -396,6 +451,7 @@ def _summarize_scene_scope(
     context_values_by_view: Dict[str, List[List[float]]],
     frame24_errors: List[float],
     eye_indices: tuple[int, ...],
+    balltoken_metrics: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     selected = [record for record in records if record["eye"] in eye_indices]
     metrics: Dict[str, Dict[str, float]] = {}
@@ -487,6 +543,18 @@ def _summarize_scene_scope(
         "median": frame24_sample_count,
         "p95": frame24_sample_count,
     }
+
+    # ball token 的并列指标：模型直接回归的球状态是全场景一个值，与 view scope 无关，
+    # 所以 aggregate 与三个具名视图 scope 记录同一个数。单场景内 median==p95（只有一个样本）；
+    # 分位数的差异在 _aggregate_scene_scope_metrics 的跨场景聚合里才产生。
+    # 没有 ball token 时不写入这些键，指标在报告中直接缺席，而不是记成 nan/失败。
+    for name in BALL_TOKEN_METRIC_NAMES:
+        value = (balltoken_metrics or {}).get(name)
+        if value is None or not math.isfinite(value):
+            continue
+        metrics[name] = {"median": value, "p95": value}
+        counts[name] = {"median": 1, "p95": 1}
+
     return {"metrics": metrics, "valid_counts": counts}
 
 
@@ -629,6 +697,15 @@ def compute_stream25_scene_metrics(
         dt=dt,
     )
 
+    # 并列的 ball token 落点（仅当模型带内建 ball token 时存在）。
+    balltoken_metrics = compute_balltoken_frame24_metrics(
+        predictions.get("ball_pos15"),
+        predictions.get("ball_v15"),
+        data_dict,
+        gt_pos24,
+        dt=dt,
+    )
+
     scope_eye_indices = {
         "aggregate": tuple(range(num_views)),
         **{
@@ -642,6 +719,7 @@ def compute_stream25_scene_metrics(
             context_values_by_view,
             frame24_errors,
             eye_indices,
+            balltoken_metrics,
         )
         for scope, eye_indices in scope_eye_indices.items()
     }
@@ -673,7 +751,7 @@ def compute_stream25_scene_metrics(
         "ms3_static_acceleration",
         "ms3_static_jerk",
     )
-    return {
+    scene_result = {
         "records": records,
         "scopes": scopes,
         "buckets": bucket_metrics,
@@ -686,6 +764,10 @@ def compute_stream25_scene_metrics(
         "considered_frame_eyes": len(records),
         "visible_ball_frame_eyes": sum(r["ball_visible"] for r in records),
     }
+    # 只有带内建 ball token 的模型才多出这个键，模型没有时 evaluation.json 与改动前逐字节一致。
+    if balltoken_metrics:
+        scene_result["balltoken"] = balltoken_metrics
+    return scene_result
 
 
 def _compact_scene_result(scene: Dict[str, Any]) -> Dict[str, Any]:
@@ -866,6 +948,13 @@ def run_evaluation(
         "worst_ratio": gate_result["worst_ratio"],
         "overall": "PASS" if gate_result["all_gates_pass"] else "FAIL",
     }
+
+    # ball token 的并列落点：只在模型带内建 ball token 时才有这些键。它不参与
+    # acceptance gate（ACCEPTANCE_TABLE 未收录），所以 all_gates_pass 与历史口径可比。
+    if "frame24_position_balltoken" in metrics:
+        result["frame24_position_balltoken_method"] = (
+            "ball_token_pos15_v15_gravity_extrapolation_rig"
+        )
 
     result = _json_safe(result)
     if output_json:
