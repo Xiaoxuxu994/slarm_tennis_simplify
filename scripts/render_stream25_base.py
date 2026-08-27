@@ -133,7 +133,23 @@ def main():
     misc.load_model(args, model)
     model.eval()
 
-    feat_extractor = None  # LSeg removed in woLSeg variant
+    # 本仓保留 LSeg：config 开了 online_feat 时 dataset 会产出
+    # frame_images_to_extract_feat，prepare_inputs_and_targets 随后会断言
+    # feat_extractor is not None（data_utils.py），所以这里必须真的建出来。
+    # 建法与 main_slarm.py:718 的训练路径一致。
+    if getattr(args, "online_feat", False):
+        from tools.lseg_feat_extractor import LSegFeatureExtractor
+        print("Using online feature, loading LSeg feature extractor...", flush=True)
+        feat_extractor = LSegFeatureExtractor(
+            args.lseg_model_pretrained_path,
+            args.lseg_model_scratch_path,
+            dtype=torch.float16 if os.environ.get("DISABLE_BFLOAT") else torch.bfloat16,
+        )
+        feat_extractor.model_pretrained = feat_extractor.model_pretrained.to(device)
+        feat_extractor.model_scratch = feat_extractor.model_scratch.to(device)
+        print("Feature extractor loaded.", flush=True)
+    else:
+        feat_extractor = None
 
     val_annotation = args.eval_annotation
     if not os.path.isabs(val_annotation):
